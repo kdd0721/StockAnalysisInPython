@@ -1,6 +1,9 @@
 import pymysql
 import pandas as pd
 from datetime import datetime
+from urllib.request import urlopen
+
+from bs4 import BeautifulSoup
 
 from Investar.settings import password
 
@@ -41,6 +44,7 @@ class DBUpdater:
                 )
             """
             curs.execute(sql)
+
         self.conn.commit()
         self.codes = dict()
         self.update_comp_info()
@@ -52,7 +56,7 @@ class DBUpdater:
     def read_krx_code(self):
         """KRX로부터 상장법인목록 파일을 읽어와서 데이터프레임으로 반환"""
         krx = pd.read_html('http://kind.krx.co.kr/corpgeneral/corpList.do?method='
-                          'download&searchType=13')[0]
+                           'download&searchType=13')[0]
         krx = krx[['종목코드', '회사명']]
         krx = krx.rename(columns={'종목코드': 'code', '회사명': 'company'})
         krx.code = krx.code.map('{:06d}'.format)
@@ -61,7 +65,7 @@ class DBUpdater:
     def update_comp_info(self):
         """종목코드를 company_info 테이블에 업데이트한 후 딕셔너리에 저장"""
         sql = """SELECT * FROM company_info"""
-        df = pd.read_html(sql, self.conn)
+        df = pd.read_sql(sql, self.conn)
         for idx in range(len(df)):
             self.codes[df['code'].values[idx]] = df['company'].values[idx]
         with self.conn.cursor() as curs:
@@ -75,17 +79,48 @@ class DBUpdater:
                 for idx in range(len(krx)):
                     code = krx.code.values[idx]
                     company = krx.company.values[idx]
-                    sql = f"REPLACE INTO company_info (code, company, last_update)" \
+                    sql = f"REPLACE INTO company_info (code, company, last_update) " \
                           f"VALUES ('{code}', '{company}', '{today}')"
                     curs.execute(sql)
                     self.codes[code] = company
                     tmnow = datetime.now().strftime('%Y-%m-%d %H:%M')
-                    print(f"[{tmnow}] {idx:04d} REPLACE INTO company_info (code, company, last_update) \
-                          VALUES ({code}, {company}, {today})")
+                    print(f"[{tmnow}] {idx:04d} REPLACE INTO company_info VALUES ({code}, {company}, {today})")
                     self.conn.commit()
 
     def read_naver(self, code, company, pages_to_fetch):
         """네이버 금융에서 주식 시세를 읽어서 데이터프레임으로 반환"""
+        try:
+            url = f"http://finance.naver.com/item/sise_day.nhn?code={code}"
+            with urlopen(url) as doc:
+                if doc is None:
+                    return None
+                html = BeautifulSoup(doc, "lxml")
+                pgrr = html.find("td", class_="pgRR")
+                if pgrr is None:
+                    return None
+                s = str(pgrr.a["href"]).split('=')
+                lastpage = s[-1]
+
+            df = pd.DataFrame()
+            pages = min(int(lastpage), pages_to_fetch)
+            for page in range(1, pages+1):
+                pg_url = '{}&page={}'.format(url, page)
+                df = df.append(pd.read_html(pg_url, header=0)[0])
+                tmnow = datetime.now().strftime('%Y-%m-%d %H:%M')
+                print('[{}] {} ({}) : {:04d}/{:04d} pages are downloading...'
+                      .format(tmnow, company, code, page, pages), end="\r")
+            df = df.rename(columns={'날짜': 'date', '종가': 'close', '전일비': 'diff'
+                                    , '시가': 'open', '고가': 'high', '종가': 'low', '거래량': 'volume'})
+            df['date'] = df['date'].replace('.', '-')
+            df = df.dropna()
+            df[['close', 'diff', 'open', 'high', 'low', 'volume']] = \
+                [['close', 'diff', 'open', 'high', 'low', 'volume']].astype(int)
+            df = df[['date', 'open', 'high', 'low', 'close', 'diff', 'volume']]
+
+        except Exception as e:
+            print('Exception occured :', e)
+            return None
+        return df
 
     def replace_into_db(self, df, num, code, company):
         """네이버 금융에서 읽어온 주식 시세를 DB에 REPLACE"""
